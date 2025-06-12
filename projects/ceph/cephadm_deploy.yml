@@ -1,0 +1,109 @@
+---
+- name: Загружаем образ ceph и устанавливаем cephadm, podman, lvm2 и chrony
+  hosts: all
+  become: true
+  gather_facts: yes
+  vars:
+    ceph_image: quay.io/ceph/ceph:v17
+  tasks:
+    - name: Проверяем, установлен ли podman
+      shell: which podman
+      register: podman_check
+      changed_when: false
+      failed_when: false
+    - name: Устанавливаем podman, если не установлен
+      apt:
+        name: podman
+        state: present
+        update_cache: true
+        force_apt_get: true
+      when: podman_check.rc != 0
+    - name: Устанавливаем lvm2 и chrony
+      apt:
+        name:
+          - lvm2
+          - chrony
+        state: present
+        update_cache: true
+    - name: Проверка, работает ли systemd
+      stat:
+        path: /run/systemd/system
+      register: systemd_present
+    - name: Пропускаем запуск chrony, если systemd не активен (например, LXC)
+      meta: end_play
+      when: not systemd_present.stat.exists
+    - name: Включаем и запускаем chrony
+      systemd:
+        name: chrony
+        enabled: true
+        state: started
+      when: systemd_present.stat.exists
+
+
+
+    - name: Проверка podman
+      command: podman --version
+      register: podman_version
+      changed_when: false
+    - name: Проверка lvm2
+      command: vgdisplay
+      register: lvm2_check
+      changed_when: false
+      ignore_errors: true
+    - name: Проверка времени
+      command: timedatectl status
+      register: time_status
+      changed_when: false
+
+
+
+    - name: Проверяем наличие нужного образа Ceph в podman
+      shell: podman image exists "{{ ceph_image }}"
+      register: ceph_image_check
+      failed_when: false
+      changed_when: false
+    - name: Скачиваем образ Ceph, если отсутствует
+      shell: podman pull "{{ ceph_image }}"
+      when: ceph_image_check.rc != 0
+    - name: Получаем список образов Ceph
+      # shell: podman images --format "{{ '{{.Repository}} {{.Tag}}' }}" | grep quay.io/ceph/ceph
+      shell: podman images | grep quay.io/ceph/ceph
+      register: cephadm_image_tags
+      changed_when: false
+      ignore_errors: true
+    - name: Показываем список образов Ceph
+      debug:
+        msg: "{{ cephadm_image_tags.stdout_lines }}"
+
+
+
+    - name: Проверяем наличие cephadm в системе
+      shell: which cephadm
+      register: cephadm_exists
+      changed_when: false
+      failed_when: false
+    - name: Устанавливаем cephadm, если не установлен
+      apt:
+        name: cephadm
+        state: present
+        force_apt_get: true
+        update_cache: true
+      when: cephadm_exists.rc != 0
+
+    - name: Получаем текущий hostname
+      command: hostname -s
+      register: current_hostname
+      changed_when: false
+
+
+
+    - name: Устанавливаем корректный hostname, если отличается
+      hostname:
+        name: "{{ inventory_hostname }}"
+      when: current_hostname.stdout != inventory_hostname
+
+    - name: Обновляем hostname через systemd (если требуется)
+      systemd:
+        name: systemd-hostnamed
+        state: restarted
+      when: current_hostname.stdout != inventory_hostname
