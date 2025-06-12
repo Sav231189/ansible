@@ -1,0 +1,91 @@
+---
+- name: Detect bootstrap node
+  hosts: mon_nodes
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Check if this node is the bootstrap node (has ceph.admin keyring)
+      stat:
+        path: /etc/ceph/ceph.client.admin.keyring
+      register: ceph_admin_key
+
+    - name: Set fact on bootstrap node
+      set_fact:
+        is_bootstrap_node: true
+      when: ceph_admin_key.stat.exists
+
+- name: Install cephadm SSH public key on all mon_nodes
+  hosts: mon_nodes
+  gather_facts: false
+  become: true
+
+  vars:
+    bootstrap_host: >-
+      {{ hostvars | dict2items
+                  | selectattr('value.is_bootstrap_node', 'defined')
+                  | selectattr('value.is_bootstrap_node')
+                  | map(attribute='key') | list | first }}
+
+  tasks:
+    - name: Fetch cephadm SSH public key from bootstrap node
+      delegate_to: "{{ bootstrap_host }}"
+      run_once: true
+      command: cephadm shell -- ceph cephadm get-pub-key
+      register: ceph_pubkey
+
+    - name: Install cephadm SSH public key
+      authorized_key:
+        user: root
+        key: "{{ ceph_pubkey.stdout }}"
+
+- name: Add all hosts to Ceph orchestrator by IP
+  hosts: mon_nodes
+  gather_facts: false
+  become: true
+  vars:
+    bootstrap_host: >-
+      {{ hostvars | dict2items
+                  | selectattr('value.is_bootstrap_node', 'defined')
+                  | selectattr('value.is_bootstrap_node')
+                  | map(attribute='key') | list | first }}
+  tasks:
+    - name: Add this host to Ceph orchestrator by IP
+      delegate_to: "{{ bootstrap_host }}"
+      run_once: false
+      shell: |
+        cephadm shell -- ceph orch host add {{ inventory_hostname }} {{ hostvars[inventory_hostname]['ansible_host'] }} --labels mon
+      register: orch_add_output
+    - name: Show Ceph host-add result
+      debug:
+        var: orch_add_output
+
+- name: Add hosts to Ceph cluster and deploy MONs
+  hosts: mon_nodes
+  gather_facts: false
+  become: true
+
+  vars:
+    bootstrap_host: >-
+      {{ hostvars | dict2items
+                  | selectattr('value.is_bootstrap_node', 'defined')
+                  | selectattr('value.is_bootstrap_node')
+                  | map(attribute='key') | list | first }}
+
+  tasks:
+    - name: Get short hostname
+      command: hostname -s
+      register: short_hostname
+
+    - name: Add this host to Ceph orchestrator by IP
+      delegate_to: "{{ bootstrap_host }}"
+      run_once: false
+      shell: |
+        cephadm shell -- ceph orch host add {{ short_hostname.stdout }} {{ hostvars[inventory_hostname]['ansible_host'] }} --labels mon
+      ignore_errors: true
+
+    - name: Apply MONs to all nodes
+      delegate_to: "{{ bootstrap_host }}"
+      run_once: true
+      shell: |
+        cephadm shell -- ceph orch apply mon --placement="{{ groups['mon_nodes'] | join(',') }}"
+
