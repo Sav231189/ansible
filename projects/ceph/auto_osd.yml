@@ -1,0 +1,80 @@
+---
+- name: Определяем bootstrap-ноду
+  hosts: all
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Проверяем, является ли узел bootstrap-нодой (наличие ключа администратора)
+      stat:
+        path: /etc/ceph/ceph.client.admin.keyring
+      register: ceph_admin_key
+
+    - name: Устанавливаем флаг is_bootstrap_node
+      set_fact:
+        is_bootstrap_node: true
+      when: ceph_admin_key.stat.exists
+
+- name: Автоматическое добавление OSD на свободные диски
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    excluded_devices:
+      - sda
+      - sr0
+      - loop
+      - dm
+      - zram
+    device_filter: "^sd|^vd|^nvme"
+
+    bootstrap_host: >-
+      {{ hostvars | dict2items
+                  | selectattr('value.is_bootstrap_node', 'defined')
+                  | selectattr('value.is_bootstrap_node')
+                  | map(attribute='key') | list | first }}
+
+  tasks:
+    - name: Получаем список блоковых устройств (через JSON)
+      command: lsblk -J -o NAME,TYPE
+      register: lsblk_json
+
+    - name: Фильтруем устройства под OSD
+      set_fact:
+        osd_devices: >-
+          {{
+            lsblk_json.stdout | from_json
+            | dict2items
+            | selectattr('key', 'equalto', 'blockdevices')
+            | map(attribute='value')
+            | list | first
+            | selectattr('type', 'equalto', 'disk')
+            | selectattr('name', 'match', device_filter)
+            | rejectattr('name', 'search', excluded_devices | join('|'))
+            | rejectattr('children', 'defined')
+            | map(attribute='name') | list
+          }}
+
+    - name: Показываем найденные устройства под OSD
+      debug:
+        msg: "На {{ inventory_hostname }} обнаружены устройства: {{ osd_devices }}"
+
+    - name: Пропускаем хост, если нет подходящих устройств
+      meta: end_host
+      when: osd_devices | length == 0
+
+    - name: Добавляем OSD через cephadm для каждого устройства
+      delegate_to: "{{ bootstrap_host }}"
+      loop: "{{ osd_devices }}"
+      loop_control:
+        label: "{{ inventory_hostname }}:/dev/{{ item }}"
+      shell: >
+        cephadm shell -- ceph orch daemon add osd {{ inventory_hostname }}:/dev/{{ item }}
+      register: osd_add_result
+      changed_when: "'Created osd' in osd_add_result.stdout or 'Created new service' in osd_add_result.stdout"
+      ignore_errors: true
+
+    - name: Вывод результата по OSD
+      debug:
+        var: osd_add_result.stdout_lines
