@@ -1,0 +1,205 @@
+---
+- name: STEP 1 — Install & configure PostgreSQL + Citus everywhere
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    pg_version: 17
+    citus_version: '13.0'
+    postgres_password: "ChangeMePassword"
+    subnet_cidr: "10.0.0.0/24"
+    repl_factor: 1
+
+  tasks:
+    - name: Ensure APT prerequisites
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Add PostgreSQL APT key
+      apt_key:
+        url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        state: present
+
+    - name: Add PostgreSQL PGDG repo
+      apt_repository:
+        repo: "deb http://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main"
+        filename: pgdg
+        state: present
+
+    - name: Add Citus community repo via script
+      shell: |
+        DISTRO=jammy bash -c "$(curl -fsSL https://install.citusdata.com/community/deb.sh)"
+      args:
+        creates: /etc/apt/sources.list.d/citusdata_community.list
+
+    - name: Workaround for Ubuntu 24.04 (noble → jammy)
+      replace:
+        path: /etc/apt/sources.list.d/citusdata_community.list
+        regexp: '\bnoble\b'
+        replace: jammy
+      when: ansible_distribution_release == "noble"
+
+    - name: Refresh APT cache (ensure Citus jammy lists are loaded)
+      apt:
+        update_cache: yes
+        cache_valid_time: 0
+
+    - name: Install PostgreSQL and Citus
+      apt:
+        name:
+          - "postgresql-{{ pg_version }}"
+          - "postgresql-{{ pg_version }}-citus-{{ citus_version }}"
+        state: present
+
+    - name: Ensure remote_tmp exists for postgres
+      file:
+        path: /var/lib/postgresql/.ansible/tmp
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0700'
+
+    - name: Set number of workers (all except coordinator)
+      set_fact:
+        num_workers: "{{ groups['all'] | length - 1 }}"
+
+    - name: Patch postgresql.conf (listen_addresses, shared_preload_libraries, tuning)
+      blockinfile:
+        path: "/etc/postgresql/{{ pg_version }}/main/postgresql.conf"
+        marker: "#--- citus-auto --- {mark}"
+        block: |
+          listen_addresses = '*'
+          shared_preload_libraries = 'citus'
+          max_connections = {{ ansible_facts.processor_vcpus | int * 100 }}
+          shared_buffers  = {{ ((ansible_facts.memtotal_mb | int) * 50 // 100) | int }}MB
+          citus.shard_count = {{ (ansible_facts.processor_vcpus | int) * (num_workers | int | default(1)) * 2 }}
+          citus.shard_replication_factor = {{ repl_factor }}
+      notify: restart postgresql
+
+    - name: Allow cluster subnet access in pg_hba.conf
+      lineinfile:
+        path: "/etc/postgresql/{{ pg_version }}/main/pg_hba.conf"
+        regexp: '^host\s+all\s+all\s+{{ subnet_cidr }}'
+        line: "host all all {{ subnet_cidr }} md5"
+        state: present
+        create: yes
+      notify: restart postgresql
+
+    - name: Ensure master access on all workers (for future connections)
+      lineinfile:
+        path: "/etc/postgresql/{{ pg_version }}/main/pg_hba.conf"
+        insertafter: '^#.*IPv4 local connections:'
+        line: "host    all             all             0.0.0.0/0           md5"
+        state: present
+        create: yes
+      notify: restart postgresql
+
+    - name: Проверить, является ли эта нода участником кластера
+      become_user: postgres
+      shell: |
+        psql -d postgres -tAc "SELECT 1 FROM pg_extension WHERE extname='citus';" | grep -q 1 && \
+        psql -d postgres -tAc "SELECT 1 FROM pg_dist_node WHERE nodename = inet_server_addr()::text" | grep -q 1 && echo "worker" || \
+        psql -d postgres -tAc "SELECT 1 FROM pg_extension WHERE extname='citus';" | grep -q 1 && echo "coordinator" || \
+        echo "not_citus"
+      register: citus_node_status
+      changed_when: false
+      failed_when: false
+
+    - name: Установить пароль для postgres (Только если НЕ воркер и НЕ координатор)
+      become_user: postgres
+      command: >
+        psql -d postgres -c "ALTER USER postgres PASSWORD '{{ postgres_password }}';"
+      when: citus_node_status.stdout.strip() == 'not_citus'
+      register: pass_out
+      changed_when: "'ALTER ROLE' in pass_out.stdout"
+      failed_when: pass_out.rc != 0 and ('ALTER ROLE' not in pass_out.stdout)
+      no_log: true
+
+  handlers:
+    - name: restart postgresql
+      service:
+        name: "postgresql@{{ pg_version }}-main"
+        state: restarted
+
+- name: STEP 2 — Citus cluster auto-setup (master registration, workers registration)
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    pg_version: 17
+    postgres_port: 5432
+    postgres_password: "ChangeMe123"
+
+  tasks:
+    - name: Find coordinator (master)
+      set_fact:
+        coordinator_host: "{{ groups['master'][0] if 'master' in groups and groups['master']|length > 0 else groups['all'][0] }}"
+
+    - name: Set flag if current host is coordinator
+      set_fact:
+        is_coordinator: "{{ inventory_hostname == coordinator_host }}"
+
+    - name: Ensure Citus extension is present on ALL nodes
+      become_user: postgres
+      command: psql -d postgres -c "CREATE EXTENSION IF NOT EXISTS citus;"
+
+    - name: Build list of worker IPs (excluding coordinator)
+      set_fact:
+        worker_ips: >-
+          {{
+            groups['all']
+            | difference([coordinator_host])
+            | map('extract', hostvars)
+            | map(attribute='ansible_host')
+            | list
+          }}
+      when: is_coordinator
+
+    - name: Create .pgpass for postgres user (coordinator)
+      become_user: postgres
+      copy:
+        dest: "/var/lib/postgresql/.pgpass"
+        content: |
+          {% for ip in worker_ips %}
+          {{ ip }}:{{ postgres_port }}:postgres:postgres:{{ postgres_password }}
+          {% endfor %}
+        owner: postgres
+        group: postgres
+        mode: '0600'
+      when: is_coordinator
+
+    - name: Get current active workers from Citus (coordinator)
+      become_user: postgres
+      command: >
+        psql -At -d postgres -c "SELECT node_name || ':' || node_port FROM master_get_active_worker_nodes();"
+      register: current_workers
+      when: is_coordinator
+
+    - name: Build list of current worker addresses (coordinator)
+      set_fact:
+        current_worker_addresses: "{{ current_workers.stdout_lines }}"
+      when: is_coordinator
+
+    - name: Register new worker nodes (coordinator, idempotent)
+      become_user: postgres
+      command: >
+        psql -d postgres -c "SELECT master_add_node('{{ item }}', {{ postgres_port }});"
+      loop: "{{ worker_ips }}"
+      loop_control:
+        label: "{{ item }}"
+      when: is_coordinator and (item ~ ':' ~ postgres_port) not in current_worker_addresses
+      register: citus_node_reg
+
+    - name: Show all connected worker IPs (coordinator)
+      debug:
+        msg: "Connected workers: {{ (current_worker_addresses | default([])) | map('split', ':') | map('first') | list | unique | join(', ') }}"
+      when: is_coordinator
+
