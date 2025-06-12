@@ -1,0 +1,15 @@
+---
+- name: Bootstrap первой ceph-ноды (так же автоматически обновляет версию quay.io/ceph/ceph). Назначается mgr (Manager daemon).
+  hosts: bootstrap
+  become: true
+  vars:
+    mon_ip: "{{ hostvars[inventory_hostname]['ansible_host'] }}"
+  tasks:
+    - name: Проверяем, был ли bootstrap
+      stat:
+        path: /etc/ceph/ceph.conf
+      register: ceph_bootstrapped
+
+    - name: Выполняем bootstrap если ещё не выполнен
+      shell: cephadm bootstrap --mon-ip {{ mon_ip }} --initial-dashboard-user admin --initial-dashboard-password admin
+      when: not ceph_bootstrapped.stat.exists
