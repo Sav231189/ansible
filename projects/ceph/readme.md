@@ -1,4 +1,4 @@
-# Установка Ceph Cluster for clear nodes (check: ubuntu_24).
+# Установка Ceph Cluster for clear nodes (checked: ubuntu_24).
 
 > У вас должен быть Inventory c группой ceph (см. ansible/readme.md)
 > 
